@@ -1,0 +1,244 @@
+import struct
+import os
+import math
+import time
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+ITEM_FILE = BASE_DIR / "items.dat"
+CATEGORY_FILE = BASE_DIR / "categories.dat"
+TRANSACTION_FILE = BASE_DIR / "transactions.dat"
+REPORT_FILE = BASE_DIR / "report.txt"
+
+ITEM_STRUCT = struct.Struct("<II128s48s48sIIfB3x")
+CATEGORY_STRUCT = struct.Struct("<I128s256sB3x")
+TRANSACTION_STRUCT = struct.Struct("<QIBIIf64s128sB3x")
+
+def encode_fixed(text: str, size: int, field_name: str) ->bytes:
+    text = text.strip()
+    if "\x00" in text:
+        raise ValueError(f"{field_name} มีอักขระที่ใช้ไม่ได้")
+    
+    data = text.encode("utf-8")
+    if len(data) > size:
+        raise ValueError(
+            f"{field_name} ยาว {len(data)} ไบต์ "
+            f"แต่ช่องนี้รับได้ไม่เกิน {size} ไบต์"
+        )
+        
+    return data.ljust(size, b"\x00")
+
+def decode_fixed(data: bytes) -> str:
+    return data.split(b"\x00", 1)[0].decode("utf-8")
+
+def read_records(path: Path, record_struct: struct.Struct) -> list[tuple]:
+    if not path.exists():
+        return []
+    
+    data = path.read_bytes()
+    
+    if len(data) % record_struct.size != 0:
+        raise ValueError(f'ไฟล์ {path.name} มีระเบียนขนาดไม่ครบ')
+    
+    return list(record_struct.iter_unpack(data))
+
+def append_record(
+    path: Path, record_struct: struct.Struct, values: tuple) -> None:
+    data = record_struct.pack(*values)
+    
+    with path.open("ab") as file:
+        file.write(data)
+        file.flush()
+        os.fsync(file.fileno())
+
+def add_category() -> None:
+    raw_id = input('รหัสหมวดหมู่: ').strip()
+    
+    if not raw_id.isascii() or not raw_id.isdecimal():
+        print('รหัสหมวดหมู่ต้องเป็นเลขจำนวนเต็ม')
+        return
+    
+    category_id = int(raw_id)
+    if not 1 <= category_id <= 0xFFFFFFFF:
+        print("กรุณาระบุรหัสหมวดหมู่ให้ถูกต้อง")
+        return
+
+    categories = read_records(CATEGORY_FILE, CATEGORY_STRUCT)
+    if any(record[0] == category_id for record in categories):
+        print("รหัสหมวดหมู่นี้มีอยู่แล้ว")
+        return
+    
+    name = input("ชื่อหมวดหมู่: ").strip()
+    if not name:
+        print("ชื่อหมวดหมู่ห้ามว่าง")
+        return
+    
+    description = input("รายละเอียดหมวดหมู่: ")
+    
+    try:
+        record = (
+            category_id,
+            encode_fixed(name, 128, "ชื่อหมวดหมู่"),
+            encode_fixed(description, 256, "รายละเอียด"),
+            1,
+        )
+    except ValueError as error:
+        print(error)
+        return
+    
+    append_record(CATEGORY_FILE, CATEGORY_STRUCT, record)
+    print("บันทึกหมวดหมู่แล้ว")
+
+def input_uint32(label: str, minimum: int = 0) -> int:
+    raw = input(label).strip()
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError(f"{label}ต้องเป็นจำนวนเต็ม")
+    value = int(raw)
+    if not minimum <= value <= 0xFFFFFFFF:
+        raise ValueError(f"{label}ต้องอยู่ระหว่าง {minimum} ถึง 4294967295")
+    return value
+
+def add_item() -> None:
+    categories = [
+        record for record in read_records(CATEGORY_FILE, CATEGORY_STRUCT)
+        if record[3] == 1
+    ]
+    if not categories:
+        print("กรุณาเพิ่มหมวดหมู่ก่อนเพิ่มพัสดุ")
+        return
+
+    print("หมวดหมู่ที่ใช้ได้:")
+    for category in categories:
+        print(f"  {category[0]}: {decode_fixed(category[1])}")
+
+    try:
+        item_id = input_uint32("รหัสพัสดุ: ", minimum=1)
+        items = read_records(ITEM_FILE, ITEM_STRUCT)
+        if any(record[0] == item_id for record in items):
+            raise ValueError("รหัสพัสดุนี้มีอยู่แล้ว")
+
+        category_id = input_uint32("รหัสหมวดหมู่: ", minimum=1)
+        if not any(record[0] == category_id for record in categories):
+            raise ValueError("ไม่พบรหัสหมวดหมู่ที่ใช้งานอยู่")
+
+        name = input("ชื่อพัสดุ: ").strip()
+        unit = input("หน่วยนับ: ").strip()
+        location = input("ตำแหน่งจัดเก็บ: ").strip()
+        if not all((name, unit, location)):
+            raise ValueError("ชื่อพัสดุ หน่วยนับ และตำแหน่งจัดเก็บห้ามว่าง")
+
+        quantity = input_uint32("จำนวนคงเหลือ: ")
+        reorder_level = input_uint32("จุดสั่งซื้อขั้นต่ำ: ")
+        price_text = input("ราคาต่อหน่วย: ").strip()
+        unit_price = float(price_text)
+        if not math.isfinite(unit_price) or unit_price < 0:
+            raise ValueError("ราคาต่อหน่วยต้องเป็นตัวเลขตั้งแต่ 0 ขึ้นไป")
+        struct.pack("<f", unit_price)
+
+        operator = input("ผู้บันทึก: ").strip()
+        if not operator:
+            raise ValueError("ชื่อผู้บันทึกห้ามว่าง")
+
+        item_record = (
+            item_id, category_id,
+            encode_fixed(name, 128, "ชื่อพัสดุ"),
+            encode_fixed(unit, 48, "หน่วยนับ"),
+            encode_fixed(location, 48, "ตำแหน่งจัดเก็บ"),
+            quantity, reorder_level, unit_price, 1,
+        )
+        logs = read_records(TRANSACTION_FILE, TRANSACTION_STRUCT)
+        log_seq = max((record[1] for record in logs), default=0) + 1
+        if log_seq > 0xFFFFFFFF:
+            raise ValueError("ลำดับประวัติเต็มแล้ว")
+        log_record = (
+            int(time.time()), log_seq, 1, item_id, quantity, float(quantity),
+            encode_fixed(operator, 64, "ผู้บันทึก"),
+            encode_fixed("เพิ่มพัสดุ", 128, "หมายเหตุ"), 1,
+        )
+        ITEM_STRUCT.pack(*item_record)
+        TRANSACTION_STRUCT.pack(*log_record)
+    except (ValueError, OverflowError, struct.error) as error:
+        print(f"ข้อมูลไม่ถูกต้อง: {error}")
+        return
+
+    append_record(ITEM_FILE, ITEM_STRUCT, item_record)
+    append_record(TRANSACTION_FILE, TRANSACTION_STRUCT, log_record)
+    print("บันทึกพัสดุและประวัติแล้ว")
+
+def view_all_categories() -> None:
+    categories = read_records(CATEGORY_FILE, CATEGORY_STRUCT)
+    print("\n=== หมวดหมู่ ===")
+    if not categories:
+        print("ยังไม่มีข้อมูลหมวดหมู่")
+        return
+
+    for category in categories:
+        status = "Active" if category[3] == 1 else "Deleted"
+        print(f"\nรหัสหมวดหมู่: {category[0]} | สถานะ: {status}")
+        print(f"ชื่อ: {decode_fixed(category[1])}")
+        print(f"รายละเอียด: {decode_fixed(category[2])}")
+
+def view_all_items() -> None:
+    items = read_records(ITEM_FILE, ITEM_STRUCT)
+    print("\n=== พัสดุ ===")
+    if not items:
+        print("ยังไม่มีข้อมูลพัสดุ")
+        return
+
+    category_names = {
+        record[0]: decode_fixed(record[1])
+        for record in read_records(CATEGORY_FILE, CATEGORY_STRUCT)
+    }
+
+    for item in items:
+        status = "Active" if item[8] == 1 else "Deleted"
+        category_name = category_names.get(item[1], "ไม่พบหมวดหมู่")
+        print(f"\nรหัสพัสดุ: {item[0]} | สถานะ: {status}")
+        print(f"หมวดหมู่: {item[1]} - {category_name}")
+        print(f"ชื่อ: {decode_fixed(item[2])}")
+        print(f"หน่วยนับ: {decode_fixed(item[3])}")
+        print(f"ตำแหน่ง: {decode_fixed(item[4])}")
+        print(f"จำนวนคงเหลือ: {item[5]}")
+        print(f"จุดสั่งซื้อขั้นต่ำ: {item[6]}")
+        print(f"ราคาต่อหน่วย: {item[7]:.2f} บาท")
+
+def main():
+    while True:
+        print("\n=== ระบบคลังพัสดุ ===")
+        print("1) เพิ่มข้อมูล")
+        print("2) แก้ไขพัสดุ")
+        print("3) ลบพัสดุ")
+        print("4) ดูข้อมูลทั้งหมด")
+        print("5) สร้าง report.txt")
+        print("6) รับพัสดุเข้า")
+        print("7) เบิกพัสดุออก")
+        print("0) ออกจากโปรแกรม")
+
+        choice = input("เลือกเมนู: ").strip()
+
+        if choice == "0":
+            print("ปิดโปรแกรม")
+            break
+        elif choice == "1":
+            print("1) เพิ่มหมวดหมู่")
+            print("2) เพิ่มพัสดุ")
+            sub_choice = input("เลือกเมนูย่อย: ").strip()
+
+            if sub_choice == "1":
+                add_category()
+            elif sub_choice == "2":
+                add_item()
+            else:
+                print("เมนูย่อยไม่ถูกต้อง")
+        elif choice == "4":
+            view_all_categories()
+            view_all_items()
+        elif choice in ("2", "3", "5", "6", "7"):
+            print("เมนูนี้กำลังเตรียมการทำงาน")
+        else:
+            print("กรุณาเลือกหมายเลขเมนูที่แสดง")
+
+
+if __name__ == "__main__":
+    main()
